@@ -70,12 +70,10 @@ class LSTMSeq(nn.Module):
         return tag_out
 
     
-def train(model, dataset):
+def train(model, dataset, n_epoch=1, lr=0.1):
     print("====================== train ======================")
     loss_fn = torch.nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-
-    n_epoch = 100
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     
     for i in range(n_epoch):
         for j in range(len(dataset)):
@@ -96,24 +94,27 @@ def val(model, dataset):
     model.eval()
     with torch.no_grad():
         for j in range(len(dataset)):
-            out = model(dataset[0][1], dataset[0][0])
-            idx = torch.argmax(out, dim=1)
+            out = model(dataset[j][1], dataset[j][0])
+            idx = torch.argmax(out.cpu().data, dim=1)
             print(j, np.sum(1*(dataset[j][2].numpy() == idx.numpy())))
             
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--n_train", "-n", type=int, default=10, help="Number of training samples")
+    p.add_argument("--n_epoch", "-e", type=int, default=100, help="Number of training epoch")
+    p.add_argument("--lr", type=float, default=0.1, help="Learning rate")
     p.add_argument("--gpu", "-g", action="store_true", help="Use GPU")
     return p.parse_args()
 
     
 def main():
     args = parse_args()
-    dataset = LSTMDataset(10, 128, cuda=args.gpu)
+    dataset = LSTMDataset(args.n_train, 128, cuda=args.gpu)
     model = LSTMSeq(148*128, 20, 1024, 128)
     if args.gpu:
         model = model.cuda()
-    model = train(model, dataset)
+    model = train(model, dataset, n_epoch=args.n_epoch, lr=args.lr)
     val(model, dataset)
 
 
