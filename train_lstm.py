@@ -96,7 +96,7 @@ def val(model, dataset):
         for j in range(len(dataset)):
             out = model(dataset[j][1], dataset[j][0])
             idx = torch.argmax(out.cpu().data, dim=1)
-            print(j, np.sum(1*(dataset[j][2].numpy() == idx.numpy())))
+            print(j, np.sum(1*(dataset[j][2].cpu().data.numpy() == idx.numpy())))
             
 
 def parse_args():
