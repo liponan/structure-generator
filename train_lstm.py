@@ -54,20 +54,32 @@ class LSTMDataset(Dataset):
     
 class LSTMSeq(nn.Module):
 
-    def __init__(self, feature_dim, embedding_dim, hidden_dim, tagset_size):
+    def __init__(self, feature_dim, embedding_dim, hidden_dim, tagset_size, bidirectional=False):
         super(LSTMSeq, self).__init__()
-        self.fc = nn.Linear(feature_dim, 2*hidden_dim)
+        if bidirectional:
+            self.fc = nn.Linear(feature_dim, 4*hidden_dim)
+            self.hidden2tag = nn.Linear(2*hidden_dim, tagset_size)
+        else:
+            self.fc = nn.Linear(feature_dim, 2*hidden_dim)
+            self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim)
-        self.hidden2tag = nn.Linear(hidden_dim, tagset_size)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, bidirectional=bidirectional)
+
+        self.bi = bidirectional
 
     def forward(self, sequence, features):
         fc_out = torch.sigmoid(self.fc(features.view(-1)))
-        h0 = fc_out[0:self.hidden_dim]
-        c0 = fc_out[self.hidden_dim:]
-        lstm_out, _ = self.lstm(sequence.view(-1, 1, self.embedding_dim), (h0.view(1,1,-1), c0.view(1,1,-1)))
-        tag_out = self.hidden2tag(torch.sigmoid(lstm_out.view(-1, self.hidden_dim)))
+        if self.bi:
+            h0 = fc_out[0:2*self.hidden_dim]
+            c0 = fc_out[2*self.hidden_dim:]
+            lstm_out, _ = self.lstm(sequence.view(-1, 1, self.embedding_dim), (h0.view(2,1,-1), c0.view(2,1,-1)))
+            tag_out = self.hidden2tag(torch.sigmoid(lstm_out.view(-1, 2*self.hidden_dim)))
+        else:
+            h0 = fc_out[0:self.hidden_dim]
+            c0 = fc_out[self.hidden_dim:]
+            lstm_out, _ = self.lstm(sequence.view(-1, 1, self.embedding_dim), (h0.view(1, 1, -1), c0.view(1, 1, -1)))
+            tag_out = self.hidden2tag(torch.sigmoid(lstm_out.view(-1, self.hidden_dim)))
         return tag_out
 
     
@@ -108,6 +120,7 @@ def parse_args():
     p.add_argument("--n_seq", "-l", type=int, default=128, help="Max sequence length")
     p.add_argument("--lr", type=float, default=0.1, help="Learning rate")
     p.add_argument("--gpu", "-g", action="store_true", help="Use GPU")
+    p.add_argument("--bidirectional", "-b", action="store_true", help="Make LSTM bidirectional")
     return p.parse_args()
 
     
@@ -115,7 +128,7 @@ def main():
     args = parse_args()
     l = args.n_seq
     train_dataset = LSTMDataset(args.n_train, l, cuda=args.gpu)
-    model = LSTMSeq((l+20)*l, 20, 1024, l)
+    model = LSTMSeq((l+20)*l, 20, 1024, l, bidirectional=args.bidirectional)
     if args.gpu:
         model = model.cuda()
     model = train(model, train_dataset, n_epoch=args.n_epoch, lr=args.lr)
