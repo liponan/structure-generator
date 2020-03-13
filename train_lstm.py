@@ -69,12 +69,12 @@ class LSTMSeq(nn.Module):
         self.bi = bidirectional
 
     def forward(self, sequence, features):
-        fc_out = torch.sigmoid(self.fc(features.view(-1)))
+        fc_out = nn.ReLU()(self.fc(features.view(-1)))
         if self.bi:
             h0 = fc_out[0:2*self.hidden_dim]
             c0 = fc_out[2*self.hidden_dim:]
             lstm_out, _ = self.lstm(sequence.view(-1, 1, self.embedding_dim), (h0.view(2,1,-1), c0.view(2,1,-1)))
-            tag_out = self.hidden2tag(torch.sigmoid(lstm_out.view(-1, 2*self.hidden_dim)))
+            tag_out = self.hidden2tag(nn.ReLU()(lstm_out.view(-1, 2*self.hidden_dim)))
         else:
             h0 = fc_out[0:self.hidden_dim]
             c0 = fc_out[self.hidden_dim:]
