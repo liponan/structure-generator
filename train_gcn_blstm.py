@@ -128,19 +128,27 @@ class GCNDataset(Dataset):
 
 class GCN(nn.Module):
 
-    def __init__(self, n_features, n_out, n_hidden=None, n_layers=1, bias=False):
+    def __init__(self, n_features, n_out, n_hidden=None, n_layers=1, bias=False, device=None):
         super(GCN, self).__init__()
         self.n_layers = n_layers
+        print("GCN layers: {}".format(self.n_layers))
         if n_hidden is None:
             n_hidden = n_out
         if n_layers == 1:
-            self.W_out = nn.nn.Linear(n_features, n_out, bias=bias)
+            self.W_out = nn.Linear(n_features, n_out, bias=bias)
+            if device is not None:
+                self.W_out = self.W_out.to(device)
         else:
             self.W_hidden = list()
             self.W_hidden.append(nn.Linear(n_features, n_hidden, bias=bias))
             for i in range(n_layers-2):
                 self.W_hidden.append(nn.Linear(n_hidden, n_hidden, bias=bias))
-            self.W_out = nn.nn.Linear(n_hidden, n_out, bias=bias)
+            if device is not None:
+                for i in range(len(self.W_hidden)):
+                    self.W_hidden[i] = self.W_hidden[i].to(device)
+            self.W_out = nn.Linear(n_hidden, n_out, bias=bias)
+            if device is not None:
+                self.W_out = self.W_out.to(device)
         self.relu = nn.ReLU()
 
     def forward(self, mat_a, mat_d, mat_f):
@@ -148,6 +156,7 @@ class GCN(nn.Module):
         x = mat_f
         # hidden layers
         for i in range(self.n_layers-1):
+            #print("layer {}".format(i))
             x = torch.mm(mat_d, x)
             x = self.relu(self.W_hidden[i](x))
         # output layer
@@ -160,29 +169,27 @@ class GCN(nn.Module):
 class GeneratorLSTM(nn.Module):
 
     def __init__(self, n_feat=20, n_node_embed=64, n_lstm_hidden=128, n_graph_embed=None, n_seq_embed=32,
-                 n_seq_alphabets=20, n_graph_layers=1, n_lstm_layers=1, lstm_bidirectional=False, graph_to_lstm=False,
+                 n_seq_alphabets=20, n_graph_layers=1, n_lstm_layers=1, bidirectional_lstm=False, graph_to_lstm=False,
                  device="cpu"):
         super(GeneratorLSTM, self).__init__()
         self.graph_to_lstm = graph_to_lstm
         self.n_lstm_hidden = n_lstm_hidden
         self.n_lstm_layers = n_lstm_layers
         self.n_seq_embed = n_seq_embed
-        if lstm_bidirectional:
+        if bidirectional_lstm:
             self.n_lstm_directions = 2
         else:
             self.n_lstm_directions = 1
         self.feat2embed = nn.Linear(n_feat, n_node_embed)
-        self.gcn = GCN(n_node_embed, n_node_embed, n_node_embed, n_graph_layers)
-        self.lstm = nn.LSTM(n_seq_embed, n_lstm_hidden, num_layers=n_lstm_layers, bidirectional=lstm_bidirectional)
+        self.gcn = GCN(n_node_embed, n_node_embed, n_node_embed, n_graph_layers, device=device, bias=True)
+        self.lstm = nn.LSTM(n_seq_embed, n_lstm_hidden, num_layers=n_lstm_layers, bidirectional=bidirectional_lstm)
         self.node2addedge = nn.Linear(n_node_embed, self.n_lstm_directions*n_lstm_hidden)
-        self.graph2addedge = nn.Linear(n_graph_embed, 1)
+        self.graph2addedge = nn.Linear(self.n_lstm_directions*n_lstm_hidden, 1)
         if self.graph_to_lstm:
             if n_graph_embed is None:
-                self.n_graph_embed = 2 * n_lstm_hidden * n_lstm_layers * n_lstm_directions
-            else:
-                self.n_lstm_hidden = n_lstm_hidden
-            self.nodes2gating = nn.Linear(n_node_embed, n_graph_embed)
-            self.nodes2graph = nn.Linear(n_node_embed, n_graph_embed)
+                self.n_graph_embed = 2 * n_lstm_hidden * n_lstm_layers * self.n_lstm_directions
+            self.nodes2gating = nn.Linear(n_node_embed, self.n_graph_embed)
+            self.nodes2graph = nn.Linear(n_node_embed, self.n_graph_embed)
         self.seq2embed = nn.Linear(n_seq_alphabets, n_seq_embed)
         self.device = device
 
@@ -198,12 +205,12 @@ class GeneratorLSTM(nn.Module):
         f_nodes_in = self.feat2embed(f_tensor)
         h_nodes_in = self.gcn(a_tensor, d_tensor, nn.ReLU()(f_nodes_in))
         if self.graph_to_lstm:
-            h_graph = self.get_graph(h_nodes_in)
-            h = h_graph[0:self.n_graph_embed].view(-1, 1, self.n_lstm_hidden)
-            c = h_graph[self.n_graph_embed:].view(-1, 1, self.n_lstm_hidden)
+            h_graph = self.get_graph(h_nodes_in).view(2, -1)
+            h = h_graph[0, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
+            c = h_graph[1, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
         else:
-            h = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden)
-            c = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden)
+            h = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
+            c = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
         lstm_out, _ = self.lstm(seq_embed.view(-1, 1, self.n_seq_embed), (h, c))
         scores = self.node2addedge(h_nodes_in).view(1, m, -1).repeat(n, 1, 1)
         scores += lstm_out.view(n, 1, -1).repeat(1, m, 1)
@@ -213,7 +220,7 @@ class GeneratorLSTM(nn.Module):
 
 
 def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, log_every=100, val_every=2000,
-          gpu=False, verbose=False):
+          device=None, verbose=False):
     print("====================== train ======================")
     t0 = time.time()
     log = dict(train=list(), val=list(), val_seen=list())
@@ -233,12 +240,12 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
             a_tensor = torch.from_numpy(a_mat).float()
             d_tensor = torch.from_numpy(d_mat).float()
             g_tensor = torch.from_numpy(gt_idxs).long()
-            if gpu:
-                x_tensor = x_tensor.cuda()
-                f_tensor = f_tensor.cuda()
-                a_tensor = a_tensor.cuda()
-                d_tensor = d_tensor.cuda()
-                g_tensor = g_tensor.cuda()
+            if device is not None:
+                x_tensor = x_tensor.to(device)
+                f_tensor = f_tensor.to(device)
+                a_tensor = a_tensor.to(device)
+                d_tensor = d_tensor.to(device)
+                g_tensor = g_tensor.to(device)
             scores, _ = model(x_tensor, f_tensor, a_tensor, d_tensor)
             loss_f = loss_fn(scores, g_tensor.long())
             loss_r = loss_fn(scores, torch.flip(g_tensor, (0, )).long())
@@ -254,24 +261,24 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
                 if (j+1) % val_every == 0:
                     if val_dataset is not None:
                         with torch.no_grad():
-                            val_acc = val(model, val_dataset, gpu, verbose=False)
+                            val_acc = val(model, val_dataset, device=device, verbose=False)
                             log["val_seen"].append(dict(seen=model.seen, acc=val_acc))
                             t2 = time.time()
                             eta = (t2 - t1) / float(j + 1) * float(len(dataset) - j - 1)
                             print("seen {}, acc {:.4f}, {:.1f}s to go for this epoch".format(model.seen, val_acc, eta))
         if val_dataset is not None:
             with torch.no_grad():
-                val_acc = val(model, val_dataset, gpu, verbose=False)
+                val_acc = val(model, val_dataset, device=device, verbose=False)
                 log["val"].append(dict(epoch=i, acc=val_acc))
-                print("seen {}, acc {}".format(model.seen, val_acc))
+                print("seen {}, acc {:.4f}".format(model.seen, val_acc))
         t2 = time.time()
         eta = (t2-t0) / float(i+1) * float(n_epoch-i-1)
-        print("time elapsed {:.1f} s, {:.1f}s for this epoch, {:.1f}s to go".format(t2-t0, t2-t1, eta))
+        print("time elapsed {:.1f}s, {:.1f}s for this epoch, {:.1f}s to go".format(t2-t0, t2-t1, eta))
         print("=======================================================================================================")
     return model, log
 
 
-def val(model, dataset, gpu=False, verbose=False, reverse_seq=False):
+def val(model, dataset, device=None, verbose=False, reverse_seq=False):
     acc_all = 0
     model.eval()
     with torch.no_grad():
@@ -284,17 +291,17 @@ def val(model, dataset, gpu=False, verbose=False, reverse_seq=False):
             a_tensor = torch.from_numpy(a_mat).float()
             d_tensor = torch.from_numpy(d_mat).float()
             g_tensor = torch.from_numpy(gt_idxs).long()
-            if gpu:
-                x_tensor = x_tensor.cuda()
-                f_tensor = f_tensor.cuda()
-                a_tensor = a_tensor.cuda()
-                d_tensor = d_tensor.cuda()
-                g_tensor = g_tensor.cuda()
+            if device is not None:
+                x_tensor = x_tensor.to(device)
+                f_tensor = f_tensor.to(device)
+                a_tensor = a_tensor.to(device)
+                d_tensor = d_tensor.to(device)
+                g_tensor = g_tensor.to(device)
             _, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor)
-            idxs = np.array(idxs)
+            idxs = np.array(idxs.data.cpu())
             if reverse_seq:
                 _, rev_idxs = model(torch.flip(x_tensor, [0]), f_tensor, a_tensor, d_tensor)
-                rev_idxs = np.array(rev_idxs[::-1])
+                rev_idxs = np.array(torch.flip(rev_idxs, [0]).data.cpu())
                 mask1 = torch.argmax(f_tensor[gt_idxs, :], dim=1) == torch.argmax(f_tensor[rev_idxs, :], dim=1)
                 mask2 = torch.argmax(f_tensor[gt_idxs, :], dim=1) != torch.argmax(f_tensor[idxs, :], dim=1)
                 mask = np.logical_and(mask1.cpu().numpy(), mask2.cpu().numpy())
@@ -324,14 +331,16 @@ def parse_args():
     p.add_argument("--n_graph_layers", type=int, default=1, help="Number of layers in GCN")
     p.add_argument("--max_n_seq", "-l", type=int, default=10, help="Max sequence length")
     p.add_argument("--lr", type=float, default=0.01, help="Learning rate")
-    p.add_argument("--gpu", "-g", action="store_true", help="Use GPU")
+    p.add_argument("--gpu", "-g", type=int, default=None, help="Use GPU x")
     p.add_argument("--df", type=str, default=None, help="Path to sequence database df")
     p.add_argument("--df_val", type=str, default=None, help="Path to sequence database df for validation")
     p.add_argument("--min_len", type=int, default=4, help="Minium sequence length")
     p.add_argument("--max_len", type=int, default=8, help="Maximum sequence length")
-    p.add_argument("--n_lstm_hidden", type=int, default=256, help="Dimenion of graph embeddings")
+    p.add_argument("--n_lstm_hidden", type=int, default=256, help="Dimenion of LSTM hidden states")
     p.add_argument("--n_node_embed", type=int, default=128, help="Dimenion of node embeddings")
     p.add_argument("--n_seq_embed", type=int, default=32, help="Dimenion of sequence embeddings")
+    p.add_argument("--graph_to_lstm", action="store_true", help="Use graph embedding for LSTM init")
+    p.add_argument("--blstm", action="store_true", help="Use bidirectional LSTM")
     p.add_argument("--seed", type=int, default=2020, help="Random seed for NumPy and Pandas")
     p.add_argument("--save", "-s", type=str, default=None, help="Path and file name for saving trained model")
     p.add_argument("--model", "-m", type=str, default=None, help="Path to the pretrained model")
@@ -346,9 +355,10 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     val_dataset = GCNDataset(n=args.n_val, max_buf_size=args.max_n_seq, df_path=args.df_val,
-                             seq_len_range=(args.min_len, args.max_len), seed=args.seed+1, verbose=args.verbose)
+                             seq_len_range=(args.min_len, args.max_len), seed=args.seed+1, verbose=False)
     model = GeneratorLSTM(n_graph_layers=args.n_graph_layers, device=args.gpu, n_lstm_hidden=args.n_lstm_hidden,
-                          n_node_embed=args.n_node_embed, n_seq_embed=args.n_seq_embed)
+                          n_node_embed=args.n_node_embed, n_seq_embed=args.n_seq_embed,
+                          graph_to_lstm=args.graph_to_lstm, bidirectional_lstm=args.blstm)
     model.seen = 0
     if args.model is not None:
         model.load_state_dict(torch.load(args.model, map_location="cpu"))
@@ -358,20 +368,22 @@ def main():
     else:
         device = torch.device("cpu")
     model = model.to(device)
+    if args.verbose:
+        print(model)
     if args.skip_training:
         pass
     else:
         train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df,
-                                   seq_len_range=(args.min_len, args.max_len), seed=args.seed, verbose=args.verbose)
+                                   seq_len_range=(args.min_len, args.max_len), seed=args.seed, verbose=False)
         model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
-                                gpu=args.gpu, verbose=args.verbose)
+                                device=device, verbose=args.verbose)
         if args.save:
             torch.save(model.state_dict(), args.save)
         if args.log:
             json_log["params"] = args.__dict__
             with open(args.log, "w") as f:
                 f.write(json.dumps(json_log))
-    val_acc = val(model, val_dataset, gpu=args.gpu, verbose=True, reverse_seq=args.reverse_seq)
+    val_acc = val(model, val_dataset, device=device, verbose=True, reverse_seq=args.reverse_seq)
     print("test on validation set: {:.5f}".format(val_acc))
 
 
