@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import h5py
 import pandas as pd
 import numpy as np
 import torch
@@ -34,18 +35,26 @@ def id2a(aid):
 
 class GCNDataset(Dataset):
 
-    def __init__(self, n, max_buf_size, df_path, seq_len_range=(128, 512), seed=0, verbose=False):
+    def __init__(self, n, max_buf_size, df_path, seq_len_range=(128, 512), seed=0, h5=None, verbose=False):
         self.rn = np.random.RandomState(seed)
         self.n = n
         self.verbose = verbose
         self.df_path = df_path
-        self.idxs = list()
-        self.f = list()
-        self.y = list()
-        self.seq = list()
-        self.gt_seq = list()
-        self.gt_idxs = list()
+        if h5 is None:
+            self.idxs = list()
+            self.f = list()
+            self.y = list()
+            self.seq = list()
+            self.gt_seq = list()
+            self.gt_idxs = list()
+            self.h5_filename = None
+            self.h5_mode = False
+        else:
+            self.h5_filename = os.path.join(h5, "gcn_lstm_{}.h5".format(seed))
+            self.h5_mode = True
         self.build(max_buf_size, seq_len_range)
+        if self.h5_mode:
+            self.h5_handle = h5py.File(self.h5_filename, "r")
 
     def build(self, max_buf_size, seq_len_range):
         if self.df_path:
@@ -54,6 +63,8 @@ class GCNDataset(Dataset):
             print("using {} ({} sequences)".format(self.df_path, len(df)))
             if self.n > 0:
                 df = df.sample(self.n, random_state=self.rn)
+        if self.h5_mode:
+            handle = h5py.File(self.h5_filename, "w")
         for i in range(self.n):
             if self.df_path:
                 my_seq_len = df["len"].iloc[i]
@@ -86,12 +97,22 @@ class GCNDataset(Dataset):
             # print("  ", "".join([id2a(j) for j in my_gt_seq]))
             for j, s in enumerate(my_seq):
                 my_feats[j, s] = 1 - np.sum(my_feats[j, :]) + my_feats[j, s]
-            self.idxs.append(my_idxs)
-            self.f.append(my_feats)
-            self.y.append(my_y)
-            self.seq.append(my_seq)
-            self.gt_seq.append(my_gt_seq)
-            self.gt_idxs.append(my_gt_idxs)
+            if self.h5_mode:
+                handle.create_dataset("idxs_{}".format(i), my_idxs.shape, data=my_idxs)
+                handle.create_dataset("f_{}".format(i), my_feats.shape, data=my_feats)
+                handle.create_dataset("y_{}".format(i), my_y.shape, data=my_y)
+                handle.create_dataset("seq_{}".format(i), my_seq.shape, data=my_seq)
+                handle.create_dataset("gt_seq_{}".format(i), my_gt_seq.shape, data=my_gt_seq)
+                handle.create_dataset("gt_idxs_{}".format(i), my_gt_idxs.shape, data=my_gt_idxs)
+            else:
+                self.idxs.append(my_idxs)
+                self.f.append(my_feats)
+                self.y.append(my_y)
+                self.seq.append(my_seq)
+                self.gt_seq.append(my_gt_seq)
+                self.gt_idxs.append(my_gt_idxs)
+        if self.h5_mode:
+            handle.close()
 
     def onehot(self, x):
         z = np.zeros((len(x), 20))
@@ -114,15 +135,21 @@ class GCNDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx):
-        my_gt_seq = self.gt_seq[idx]
-        my_idxs = self.idxs[idx]
+        if self.h5_mode:
+            my_gt_seq = self.h5_handle["gt_seq_{}".format(idx)][()]
+            my_idxs = self.h5_handle["idxs_{}".format(idx)][()]
+            y = self.h5_handle["y_{}".format(idx)][()]
+            f = self.h5_handle["f_{}".format(idx)][()]
+            gt_idxs = self.h5_handle["gt_idxs_{}".format(idx)][()]
+        else:
+            my_gt_seq = self.gt_seq[idx]
+            my_idxs = self.idxs[idx]
+            y = self.y[idx]
+            f = self.f[idx]
+            gt_idxs = self.gt_idxs[idx]
         x = self.onehot(my_gt_seq)
-        y = self.y[idx]
-        f = self.f[idx]
         a_mat = self.make_a_matrix(my_idxs)
         d_mat = self.make_d_matrix(a_mat)
-        gt_idxs = self.gt_idxs[idx]
-
         return x, y, f, a_mat, d_mat, gt_idxs
 
 
@@ -141,7 +168,7 @@ class GCN(nn.Module):
         else:
             self.W_hidden = list()
             self.W_hidden.append(nn.Linear(n_features, n_hidden, bias=bias))
-            for i in range(n_layers-2):
+            for i in range(n_layers-1):
                 self.W_hidden.append(nn.Linear(n_hidden, n_hidden, bias=bias))
             if device is not None:
                 for i in range(len(self.W_hidden)):
@@ -160,8 +187,8 @@ class GCN(nn.Module):
             x = torch.mm(mat_d, x)
             x = self.relu(self.W_hidden[i](x))
         # output layer
-            x = torch.mm(mat_d, x)
-            x = self.W_out(x)
+        x = torch.mm(mat_d, x)
+        x = self.W_out(x)
         return x
 
 
@@ -347,6 +374,7 @@ def parse_args():
     p.add_argument("--log", type=str, default=None, help="Path and file name for saving training log")
     p.add_argument("--skip_training", action="store_true", help="Skip training")
     p.add_argument("--reverse_seq", action="store_true", help="Reverse sequence when validating")
+    p.add_argument("--h5_tmp", type=str, default=None, help="Save simulated data as h5 file to the given path")
     p.add_argument("--verbose", "-v", action="store_true", help="Be verbose")
     return p.parse_args()
 
@@ -373,7 +401,7 @@ def main():
     if args.skip_training:
         pass
     else:
-        train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df,
+        train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df, h5=args.h5_tmp,
                                    seq_len_range=(args.min_len, args.max_len), seed=args.seed, verbose=False)
         model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
                                 device=device, verbose=args.verbose)
