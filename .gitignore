@@ -1,1 +1,6 @@
 # Created by .ignore support plugin (hsz.mobi)
+.pyc
+.DS_Store
+.idea/
+.ipynb_checkpoints/
+__pycache__/
