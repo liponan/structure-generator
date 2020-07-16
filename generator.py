@@ -5,7 +5,7 @@ import h5py
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -33,124 +33,167 @@ def id2a(aid):
     return table[aid]
 
 
+def onehot(x):
+    z = np.zeros((len(x), 20))
+    for i, c in enumerate(x):
+        z[i, c] = 1
+    return z
+
+
+def make_contact_map(ca_coors, mask=None, cutoff=4):
+    # print("ca_coors", ca_coors.shape)
+    print("ca_coors max", np.max(ca_coors), "ca_coors min", np.min(ca_coors))
+    dist_map = np.linalg.norm(ca_coors[np.newaxis, :, :] - ca_coors[:, np.newaxis, :], axis=2)
+    cont_map = dist_map < cutoff
+    if mask is not None:
+        cont_map[~mask, :] = False
+        cont_map[:, ~mask] = False
+        cont_map[~mask, ~mask] = True
+    print("{0} contacts in the {1}x{1} contact map".format(np.sum(1.0*cont_map)-cont_map.shape[0], cont_map.shape[0]))
+    return cont_map
+
+
+def make_a_matrix(idxs, self_loop=True):
+    mat = (np.repeat(idxs.reshape(-1, 1), idxs.shape[0], 1) - np.repeat(idxs.reshape(1, -1), idxs.shape[0], 0))
+    mat = 1.0 * (abs(mat) == 1)
+    if self_loop:
+        mat = mat + np.eye(len(idxs))
+    return mat
+
+
+def make_d_matrix(a_mat):
+    mat = np.eye(a_mat.shape[0]) * np.sum(a_mat, axis=1) ** (-0.5)
+    return mat
+
+
 class GCNDataset(Dataset):
 
-    def __init__(self, n, max_buf_size, df_path, seq_len_range=(128, 512), seed=0, h5=None, verbose=False):
+    def __init__(self, n, max_buf_size, df_path, seq_len_range=(128, 512), seed=0, h5=None, build_on_the_fly=False,
+                 verbose=False):
         self.rn = np.random.RandomState(seed)
         self.n = n
         self.verbose = verbose
         self.df_path = df_path
+        self.df = None
+        self.max_buf_size = max_buf_size
+        self.seq_len_range = seq_len_range
+        self.build_on_the_fly = build_on_the_fly
+        if self.df_path:
+            self.df = pd.read_hdf(self.df_path, "df").query("len >= {} and len <= {}".format(*self.seq_len_range))
+            if "standard" in self.df:
+                self.df = self.df.query("standard")
+            print("Using {} out of {} sequences".format(self.df_path, len(self.df)))
+            if 0 < self.n <= len(self.df):
+                self.df = self.df.sample(self.n, random_state=self.rn)
+            else:
+                self.n = len(self.df)
+            self.use_df_data = True
+            print(self.df["len"].describe())
+        else:
+            self.use_df_data = False
         if h5 is None:
             self.idxs = list()
             self.f = list()
-            self.y = list()
             self.seq = list()
             self.gt_seq = list()
             self.gt_idxs = list()
             self.h5_filename = None
             self.h5_mode = False
         else:
-            self.h5_filename = os.path.join(h5, "gcn_lstm_{}.h5".format(seed))
+            self.h5_filename = os.path.join(h5, "gcn_lstm_{}_{}_{}_{}_{}.h5".format(max_buf_size, seq_len_range[0],
+                                                                                    seq_len_range[1], n, seed))
             self.h5_mode = True
-        self.build(max_buf_size, seq_len_range)
+        if self.build_on_the_fly:
+            pass
+        else:
+            self.build_all()
         if self.h5_mode:
             self.h5_handle = h5py.File(self.h5_filename, "r")
 
-    def build(self, max_buf_size, seq_len_range):
-        if self.df_path:
-            df = pd.read_hdf(self.df_path, "df").query("len >= {} and len <= {} and standard".format(seq_len_range[0],
-                                                                                                     seq_len_range[1]))
-            print("using {} ({} sequences)".format(self.df_path, len(df)))
-            if self.n > 0:
-                df = df.sample(self.n, random_state=self.rn)
-        if self.h5_mode:
-            handle = h5py.File(self.h5_filename, "w")
-        for i in range(self.n):
-            if self.df_path:
-                my_seq_len = df["len"].iloc[i]
-            else:
-                my_seq_len = self.rn.randint(seq_len_range[0], seq_len_range[1])
-            my_seq_idxs = np.arange(my_seq_len)
-            if self.verbose:
-                print("my_seq_idxs", my_seq_idxs.shape)
-            my_dummy_idxs = self.rn.permutation(np.arange(seq_len_range[1], 2 * max_buf_size))[
-                            0:(max_buf_size - my_seq_len)]
+    def build_one(self, idx):
+        my_a_mat = None
+        make_dummy = True
+        if self.use_df_data:
+            my_seq_len = self.df["len"].iloc[idx]
+            my_seq = np.array([a2id(c) for c in self.df["seq"].iloc[idx]])
+            if "CA_coors" in self.df:
+                my_a_mat = 1.0 * make_contact_map(self.df["CA_coors"].iloc[idx] * 0.01,
+                                                  self.df["mask"].iloc[idx])
+                if self.verbose:
+                    print("contact map created", my_a_mat.shape)
+                make_dummy = False
+        else:
+            my_seq_len = self.rn.randint(self.seq_len_range[0], self.seq_len_range[1])
+            my_seq = self.rn.randint(0, 20, my_seq_len)
+        my_seq_idxs = np.arange(my_seq_len)
+        if self.verbose:
+            print("my_seq_idxs", my_seq_idxs.shape)
+        if make_dummy:
+            my_dummy_idxs = self.rn.permutation(np.arange(self.seq_len_range[1], 2 * self.max_buf_size))[
+                            0:(self.max_buf_size - my_seq_len)]
             if self.verbose:
                 print("my_dummy_idxs", my_dummy_idxs.shape)
-            my_rand_idxs = self.rn.permutation(max_buf_size)
+            my_rand_idxs = self.rn.permutation(self.max_buf_size)
             if self.verbose:
                 print("my_rand_idxs", my_rand_idxs.shape)
             my_idxs = np.concatenate((my_seq_idxs, my_dummy_idxs))[my_rand_idxs]
             if self.verbose:
                 print("my_idxs", my_idxs.shape)
-            my_y = 1 * (my_idxs < my_seq_len)
-            if self.df_path:
-                my_seq = np.array([a2id(c) for c in df["seq"].iloc[i]])
-            else:
-                my_seq = self.rn.randint(0, 20, my_seq_len)
-            my_seq = np.concatenate((my_seq, self.rn.randint(0, 20, max_buf_size-my_seq_len)))
+            my_seq = np.concatenate((my_seq, self.rn.randint(0, 20, self.max_buf_size - my_seq_len)))
             my_seq = my_seq[my_rand_idxs]
-            my_feats = 0.01 * abs(self.rn.randn(len(my_seq), 20))
-            my_gt_idxs = np.argsort(my_idxs)[0:my_seq_len]
-            my_gt_seq = my_seq[my_gt_idxs]
-            # print("GT", df["seq"].iloc[i])
-            # print("  ", "".join([id2a(j) for j in my_gt_seq]))
-            for j, s in enumerate(my_seq):
-                my_feats[j, s] = 1 - np.sum(my_feats[j, :]) + my_feats[j, s]
+        else:
+            my_idxs = my_seq_idxs
+        my_feats = 0.01 * abs(self.rn.randn(len(my_seq), 20))
+        my_gt_idxs = np.argsort(my_idxs)[0:my_seq_len]
+        my_gt_seq = my_seq[my_gt_idxs]
+        for j, s in enumerate(my_seq):
+            my_feats[j, s] = 1 - np.sum(my_feats[j, :]) + my_feats[j, s]
+        return my_idxs, my_feats, my_seq, my_gt_seq, my_gt_idxs, my_a_mat
+
+    def build_all(self):
+        if self.h5_mode:
+            handle = h5py.File(self.h5_filename, "w")
+        for i in range(self.n):
+            my_idxs, my_feats, my_seq, my_gt_seq, my_gt_idxs, my_a_mat = self.build_one(i)
             if self.h5_mode:
                 handle.create_dataset("idxs_{}".format(i), my_idxs.shape, data=my_idxs)
                 handle.create_dataset("f_{}".format(i), my_feats.shape, data=my_feats)
-                handle.create_dataset("y_{}".format(i), my_y.shape, data=my_y)
                 handle.create_dataset("seq_{}".format(i), my_seq.shape, data=my_seq)
                 handle.create_dataset("gt_seq_{}".format(i), my_gt_seq.shape, data=my_gt_seq)
                 handle.create_dataset("gt_idxs_{}".format(i), my_gt_idxs.shape, data=my_gt_idxs)
             else:
                 self.idxs.append(my_idxs)
                 self.f.append(my_feats)
-                self.y.append(my_y)
                 self.seq.append(my_seq)
                 self.gt_seq.append(my_gt_seq)
                 self.gt_idxs.append(my_gt_idxs)
+            if (i+1) % 10000 == 0:
+                print("processed {} sequences".format(i+1))
         if self.h5_mode:
             handle.close()
-
-    def onehot(self, x):
-        z = np.zeros((len(x), 20))
-        for i, c in enumerate(x):
-            z[i, c] = 1
-        return z
-
-    def make_a_matrix(self, idxs, self_loop=True):
-        mat = (np.repeat(idxs.reshape(-1, 1), idxs.shape[0], 1) - np.repeat(idxs.reshape(1, -1), idxs.shape[0], 0))
-        mat = 1.0 * (abs(mat) == 1)
-        if self_loop:
-            mat = mat + np.eye(len(idxs))
-        return mat
-
-    def make_d_matrix(self, a_mat):
-        mat = np.eye(a_mat.shape[0]) * np.sum(a_mat, axis=1) ** (-0.5)
-        return mat
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, idx):
-        if self.h5_mode:
+        a_mat = None
+        if self.build_on_the_fly:
+            my_idxs, f, my_seq, my_gt_seq, gt_idxs, a_mat = self.build_one(idx)
+        elif self.h5_mode:
             my_gt_seq = self.h5_handle["gt_seq_{}".format(idx)][()]
             my_idxs = self.h5_handle["idxs_{}".format(idx)][()]
-            y = self.h5_handle["y_{}".format(idx)][()]
             f = self.h5_handle["f_{}".format(idx)][()]
             gt_idxs = self.h5_handle["gt_idxs_{}".format(idx)][()]
         else:
             my_gt_seq = self.gt_seq[idx]
             my_idxs = self.idxs[idx]
-            y = self.y[idx]
             f = self.f[idx]
             gt_idxs = self.gt_idxs[idx]
-        x = self.onehot(my_gt_seq)
-        a_mat = self.make_a_matrix(my_idxs)
-        d_mat = self.make_d_matrix(a_mat)
-        return x, y, f, a_mat, d_mat, gt_idxs
+        x = onehot(my_gt_seq)
+        if a_mat is None:
+            a_mat = make_a_matrix(my_idxs)
+        d_mat = make_d_matrix(a_mat)
+        return x, f, a_mat, d_mat, gt_idxs
 
 
 class GCN(nn.Module):
@@ -163,32 +206,38 @@ class GCN(nn.Module):
             n_hidden = n_out
         if n_layers == 1:
             self.W_out = nn.Linear(n_features, n_out, bias=bias)
-            if device is not None:
-                self.W_out = self.W_out.to(device)
+            # if device is not None:
+            #     self.W_out = self.W_out.to(device)
         else:
-            self.W_hidden = list()
-            self.W_hidden.append(nn.Linear(n_features, n_hidden, bias=bias))
-            for i in range(n_layers-1):
-                self.W_hidden.append(nn.Linear(n_hidden, n_hidden, bias=bias))
-            if device is not None:
-                for i in range(len(self.W_hidden)):
-                    self.W_hidden[i] = self.W_hidden[i].to(device)
+            self.W1 = nn.Linear(n_features, n_hidden, bias=bias)
+            if n_layers > 2:
+                self.W2 = nn.Linear(n_hidden, n_hidden, bias=bias)
+            if n_layers > 3:
+                self.W3 = nn.Linear(n_hidden, n_hidden, bias=bias)
+            if n_layers > 4:
+                self.W4 = nn.Linear(n_hidden, n_hidden, bias=bias)
             self.W_out = nn.Linear(n_hidden, n_out, bias=bias)
-            if device is not None:
-                self.W_out = self.W_out.to(device)
         self.relu = nn.ReLU()
 
     def forward(self, mat_a, mat_d, mat_f):
         mat_d = torch.mm(torch.mm(mat_d, mat_a), mat_d)
         x = mat_f
-        # hidden layers
-        for i in range(self.n_layers-1):
-            #print("layer {}".format(i))
+        if self.n_layers > 1:
             x = torch.mm(mat_d, x)
-            x = self.relu(self.W_hidden[i](x))
+            x = self.relu(self.W1(x))
+        if self.n_layers > 2:
+            x = torch.mm(mat_d, x)
+            x = self.relu(self.W2(x))
+        if self.n_layers > 3:
+            x = torch.mm(mat_d, x)
+            x = self.relu(self.W3(x))
+        if self.n_layers > 4:
+            x = torch.mm(mat_d, x)
+            x = self.relu(self.W4(x))
         # output layer
-        x = torch.mm(mat_d, x)
-        x = self.W_out(x)
+        if self.n_layers > 0:
+            x = torch.mm(mat_d, x)
+            x = self.W_out(x)
         return x
 
 
@@ -253,20 +302,24 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
     log = dict(train=list(), val=list(), val_seen=list())
     loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False)
     for i in range(n_epoch):
         t1 = time.time()
-        for j in range(len(dataset)):
+        for j, data in enumerate(dataloader):
             model.train()
             model.zero_grad()
-            x, _, f, a_mat, d_mat, gt_idxs = dataset[j]
-            n = len(gt_idxs)
+            x, f, a_mat, d_mat, gt_idxs = data
             if verbose:
-                print(j, list(gt_idxs), n)
-            x_tensor = torch.from_numpy(x).float()
-            f_tensor = torch.from_numpy(f).float()
-            a_tensor = torch.from_numpy(a_mat).float()
-            d_tensor = torch.from_numpy(d_mat).float()
-            g_tensor = torch.from_numpy(gt_idxs).long()
+                print("x", x.size(), "f", f.size(), "a_mat", a_mat.size(), "d_mat", d_mat.size(),
+                      "gt_idxs", gt_idxs.size())
+            n = len(gt_idxs[0, :])
+            if verbose:
+                print(j, list(gt_idxs[0, :]), n)
+            x_tensor = x[0, :].float()
+            f_tensor = f[0, :].float()
+            a_tensor = a_mat[0, :].float()
+            d_tensor = d_mat[0, :].float()
+            g_tensor = gt_idxs[0, :].long()
             if device is not None:
                 x_tensor = x_tensor.to(device)
                 f_tensor = f_tensor.to(device)
@@ -305,13 +358,13 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
     return model, log
 
 
-def val(model, dataset, device=None, verbose=False, reverse_seq=False):
+def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=None):
     acc_all = 0
     model.eval()
     with torch.no_grad():
         for j in range(len(dataset)):
             model.zero_grad()
-            x, _, f, a_mat, d_mat, gt_idxs = dataset[j]
+            x, f, a_mat, d_mat, gt_idxs = dataset[j]
             n = len(gt_idxs)
             x_tensor = torch.from_numpy(x).float()
             f_tensor = torch.from_numpy(f).float()
@@ -324,7 +377,7 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False):
                 a_tensor = a_tensor.to(device)
                 d_tensor = d_tensor.to(device)
                 g_tensor = g_tensor.to(device)
-            _, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor)
+            scores, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor)
             idxs = np.array(idxs.data.cpu())
             if reverse_seq:
                 _, rev_idxs = model(torch.flip(x_tensor, [0]), f_tensor, a_tensor, d_tensor)
@@ -344,6 +397,9 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False):
                 print("GT", list(gt_idxs), n)
                 print("PR", list(idxs), n)
                 print(j, acc)
+            if output is not None:
+                scores_np = scores.data.cpu().numpy()
+                np.save(os.path.join(output, "{}.npy".format(str(j).zfill(6))), scores_np)
     acc_all = acc_all / len(dataset)
     if verbose:
         print("overall acc:", acc_all)
@@ -370,11 +426,13 @@ def parse_args():
     p.add_argument("--blstm", action="store_true", help="Use bidirectional LSTM")
     p.add_argument("--seed", type=int, default=2020, help="Random seed for NumPy and Pandas")
     p.add_argument("--save", "-s", type=str, default=None, help="Path and file name for saving trained model")
+    p.add_argument("--save_val", type=str, default=None, help="Path saving inference results")
     p.add_argument("--model", "-m", type=str, default=None, help="Path to the pretrained model")
     p.add_argument("--log", type=str, default=None, help="Path and file name for saving training log")
     p.add_argument("--skip_training", action="store_true", help="Skip training")
     p.add_argument("--reverse_seq", action="store_true", help="Reverse sequence when validating")
     p.add_argument("--h5_tmp", type=str, default=None, help="Save simulated data as h5 file to the given path")
+    p.add_argument("--build_on_the_fly", action="store_true", help="Generate simulated data on the fly")
     p.add_argument("--verbose", "-v", action="store_true", help="Be verbose")
     return p.parse_args()
 
@@ -402,7 +460,8 @@ def main():
         pass
     else:
         train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df, h5=args.h5_tmp,
-                                   seq_len_range=(args.min_len, args.max_len), seed=args.seed, verbose=False)
+                                   seq_len_range=(args.min_len, args.max_len), build_on_the_fly=args.build_on_the_fly,
+                                   seed=args.seed, verbose=False)
         model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
                                 device=device, verbose=args.verbose)
         if args.save:
@@ -411,7 +470,7 @@ def main():
             json_log["params"] = args.__dict__
             with open(args.log, "w") as f:
                 f.write(json.dumps(json_log))
-    val_acc = val(model, val_dataset, device=device, verbose=True, reverse_seq=args.reverse_seq)
+    val_acc = val(model, val_dataset, device=device, verbose=True, reverse_seq=args.reverse_seq, output=args.save_val)
     print("test on validation set: {:.5f}".format(val_acc))
 
 
