@@ -10,16 +10,19 @@ import torch.nn as nn
 import torch.optim as optim
 from aa_code_utils import *
 from dataset import GCNDataset
-from networks import GeneratorLSTM
+from networks import GeneratorLSTM, FocalLoss
 import argparse
 
 
 def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, log_every=100, val_every=2000,
-          device=None, verbose=False):
+          focalloss=None, device=None, verbose=False):
     print("====================== train ======================")
     t0 = time.time()
     log = dict(train=list(), val=list(), val_seen=list())
-    loss_fn = nn.CrossEntropyLoss()
+    if focalloss is not None:
+        loss_fn = FocalLoss(weight=None, gamma=focalloss)
+    else:
+        loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False)
     for i in range(n_epoch):
@@ -133,6 +136,7 @@ def parse_args():
     p.add_argument("--n_graph_layers", type=int, default=1, help="Number of layers in GCN")
     p.add_argument("--max_n_seq", "-l", type=int, default=10, help="Max sequence length")
     p.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    p.add_argument("--focalloss", type=float, default=None, help="Gamma parameter for FocalLoss")
     p.add_argument("--gpu", "-g", type=int, default=None, help="Use GPU x")
     p.add_argument("--df", type=str, default=None, help="Path to sequence database df")
     p.add_argument("--df_val", type=str, default=None, help="Path to sequence database df for validation")
@@ -182,7 +186,7 @@ def main():
                                    seq_len_range=(args.min_len, args.max_len), build_on_the_fly=args.build_on_the_fly,
                                    seed=args.seed, verbose=False)
         model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
-                                device=device, verbose=args.verbose)
+                                device=device, focalloss=args.focalloss, verbose=args.verbose)
         if args.save:
             torch.save(model.state_dict(), args.save)
         if args.log:

@@ -97,3 +97,22 @@ class GeneratorLSTM(nn.Module):
         scores = self.graph2addedge(nn.ReLU()(scores.view(n*m, -1))).view(n, m)
         idxs = torch.argmax(scores, dim=1)
         return scores, idxs
+
+
+class FocalLoss(nn.Module):
+
+    def __init__(self, weight, gamma=2, reduce=True, ignore_index=-1):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduce = reduce
+        self.ce = nn.CrossEntropyLoss(weight=weight, reduction="none", ignore_index=ignore_index)
+        self.mod = nn.CrossEntropyLoss(reduction="none", ignore_index=ignore_index)
+
+    def forward(self, scores, targets):
+        ce_loss = self.ce(scores, targets)
+        f_loss = (1 - torch.exp(-self.mod(scores, targets)))**self.gamma * ce_loss
+        if self.reduce:
+            return torch.mean(f_loss)
+        else:
+            return f_loss
