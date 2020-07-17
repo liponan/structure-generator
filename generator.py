@@ -49,9 +49,7 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
                 d_tensor = d_tensor.to(device)
                 g_tensor = g_tensor.to(device)
             scores, _ = model(x_tensor, f_tensor, a_tensor, d_tensor)
-            loss_f = loss_fn(scores, g_tensor.long())
-            loss_r = loss_fn(scores, torch.flip(g_tensor, (0, )).long())
-            loss = torch.min(loss_f, loss_r)
+            loss= loss_fn(scores, g_tensor.long())
             loss.backward()
             optimizer.step()
             with torch.no_grad():
