@@ -15,7 +15,7 @@ import argparse
 
 
 def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, log_every=100, val_every=2000,
-          focalloss=None, device=None, verbose=False):
+          focalloss=None, atomloss_weight=0, device=None, verbose=False):
     print("====================== train ======================")
     t0 = time.time()
     log = dict(train=list(), val=list(), val_seen=list())
@@ -23,14 +23,17 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
         loss_fn = FocalLoss(weight=None, gamma=focalloss)
     else:
         loss_fn = nn.CrossEntropyLoss()
+    atom_loss_fn = nn.SmoothL1Loss()
+    atomloss_threshold = torch.Tensor([4.0]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
     for i in range(n_epoch):
         t1 = time.time()
         for j, data in enumerate(dataloader):
             model.train()
             model.zero_grad()
-            x, f, a_mat, d_mat, gt_idxs = data
+            x, f, a_mat, d_mat, gt_idxs, ca_coor, ca_mask = data
+            # print("ca_coor", ca_coor.size(), "ca_mask", ca_mask.size())
             if verbose:
                 print("x", x.size(), "f", f.size(), "a_mat", a_mat.size(), "d_mat", d_mat.size(),
                       "gt_idxs", gt_idxs.size())
@@ -42,14 +45,27 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
             a_tensor = a_mat[0, :].float()
             d_tensor = d_mat[0, :].float()
             g_tensor = gt_idxs[0, :].long()
+            coor_tensor = ca_coor[0, :, :].float()
+            mask_tensor = ca_mask[0, :].float()
             if device is not None:
                 x_tensor = x_tensor.to(device)
                 f_tensor = f_tensor.to(device)
                 a_tensor = a_tensor.to(device)
                 d_tensor = d_tensor.to(device)
                 g_tensor = g_tensor.to(device)
-            scores, _ = model(x_tensor, f_tensor, a_tensor, d_tensor)
-            loss= loss_fn(scores, g_tensor.long())
+                coor_tensor = coor_tensor.to(device)
+                mask_tensor = mask_tensor.to(device)
+            scores, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor, coor_tensor, mask_tensor)
+            bce_loss = loss_fn(scores, g_tensor.long())
+            if atomloss_weight > 0:
+                mask_tensor = (mask_tensor[idxs[:-1]] * mask_tensor[idxs[1:]]) > 0
+                ca_dists = torch.max(
+                    torch.norm(coor_tensor[idxs[0:-1], :] - coor_tensor[idxs[1:], :], dim=1)[mask_tensor],
+                    atomloss_threshold)
+                atom_loss = atom_loss_fn(ca_dists, atomloss_threshold*torch.ones_like(ca_dists))
+                loss = bce_loss + atomloss_weight * atom_loss
+            else:
+                loss = bce_loss
             loss.backward()
             optimizer.step()
             with torch.no_grad():
@@ -84,26 +100,30 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=No
     with torch.no_grad():
         for j in range(len(dataset)):
             model.zero_grad()
-            x, f, a_mat, d_mat, gt_idxs = dataset[j]
+            x, f, a_mat, d_mat, gt_idxs, ca_coor, ca_mask = dataset[j]
             n = len(gt_idxs)
             x_tensor = torch.from_numpy(x).float()
             f_tensor = torch.from_numpy(f).float()
             a_tensor = torch.from_numpy(a_mat).float()
             d_tensor = torch.from_numpy(d_mat).float()
             g_tensor = torch.from_numpy(gt_idxs).long()
+            coor_tensor = torch.from_numpy(ca_coor).float()
+            mask_tensor = torch.from_numpy(ca_mask).float()
             if device is not None:
                 x_tensor = x_tensor.to(device)
                 f_tensor = f_tensor.to(device)
                 a_tensor = a_tensor.to(device)
                 d_tensor = d_tensor.to(device)
                 g_tensor = g_tensor.to(device)
-            scores, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor)
+                coor_tensor = coor_tensor.to(device)
+                mask_tensor = mask_tensor.to(device)
+            scores, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor, coor_tensor, mask_tensor)
             idxs = np.array(idxs.data.cpu())
             if reverse_seq:
                 _, rev_idxs = model(torch.flip(x_tensor, [0]), f_tensor, a_tensor, d_tensor)
                 rev_idxs = np.array(torch.flip(rev_idxs, [0]).data.cpu())
-                mask1 = torch.argmax(f_tensor[gt_idxs, :], dim=1) == torch.argmax(f_tensor[rev_idxs, :], dim=1)
-                mask2 = torch.argmax(f_tensor[gt_idxs, :], dim=1) != torch.argmax(f_tensor[idxs, :], dim=1)
+                mask1 = torch.argmax(f_tensor[gt_idxs, 0:20], dim=1) == torch.argmax(f_tensor[rev_idxs, 0:20], dim=1)
+                mask2 = torch.argmax(f_tensor[gt_idxs, 0:20], dim=1) != torch.argmax(f_tensor[idxs, 0:20], dim=1)
                 mask = np.logical_and(mask1.cpu().numpy(), mask2.cpu().numpy())
                 idxs[mask] = rev_idxs[mask]
             acc_f = np.sum(1 * (idxs == gt_idxs))
@@ -112,8 +132,8 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=No
             acc = acc / float(len(gt_idxs))
             acc_all = acc_all + acc
             if verbose:
-                print("GT", "".join([id2a(c) for c in list(torch.argmax(f_tensor[gt_idxs, :], dim=1))]))
-                print("PR", "".join([id2a(c) for c in list(torch.argmax(f_tensor[idxs, :], dim=1))]))
+                print("GT", "".join([id2a(c) for c in list(torch.argmax(f_tensor[gt_idxs, :20], dim=1))]))
+                print("PR", "".join([id2a(c) for c in list(torch.argmax(f_tensor[idxs, :20], dim=1))]))
                 print("GT", list(gt_idxs), n)
                 print("PR", list(idxs), n)
                 print(j, acc)
@@ -135,17 +155,26 @@ def parse_args():
     p.add_argument("--max_n_seq", "-l", type=int, default=10, help="Max sequence length")
     p.add_argument("--lr", type=float, default=0.01, help="Learning rate")
     p.add_argument("--focalloss", type=float, default=None, help="Gamma parameter for FocalLoss")
+    p.add_argument("--atomloss_weight", type=float, default=0, help="Weight for C-alpha distance L1 loss")
     p.add_argument("--gpu", "-g", type=int, default=None, help="Use GPU x")
+    p.add_argument("--val_every", type=int, default=2000, help="Validate every X steps")
     p.add_argument("--df", type=str, default=None, help="Path to sequence database df")
     p.add_argument("--df_val", type=str, default=None, help="Path to sequence database df for validation")
     p.add_argument("--min_len", type=int, default=4, help="Minium sequence length")
     p.add_argument("--max_len", type=int, default=8, help="Maximum sequence length")
+    p.add_argument("--contact_cutoff", type=float, default=4.0, help="Cutoff for contact map")
+    p.add_argument("--contact_sigma", type=float, default=None, help="STD for continuous contact map")
     p.add_argument("--n_lstm_hidden", type=int, default=256, help="Dimenion of LSTM hidden states")
     p.add_argument("--n_node_embed", type=int, default=128, help="Dimenion of node embeddings")
     p.add_argument("--n_seq_embed", type=int, default=32, help="Dimenion of sequence embeddings")
+    p.add_argument("--n_dist_embed", type=int, default=0, help="Dimenion of distance embeddings")
+    p.add_argument("--dummy_ratio", type=int, default=0, help="Ratio of dummy nodes. 1 means no decoys.")
     p.add_argument("--graph_to_lstm", action="store_true", help="Use graph embedding for LSTM init")
+    p.add_argument("--pose_feat", action="store_true", help="Use backbone pose as additional feature")
     p.add_argument("--blstm", action="store_true", help="Use bidirectional LSTM")
+    p.add_argument("--auto_regressive", action="store_true", help="Use the auto-regressive model")
     p.add_argument("--seed", type=int, default=2020, help="Random seed for NumPy and Pandas")
+    p.add_argument("--coor_std", type=float, default=0, help="Add Gaussian noise to CA coordinates")
     p.add_argument("--save", "-s", type=str, default=None, help="Path and file name for saving trained model")
     p.add_argument("--save_val", type=str, default=None, help="Path saving inference results")
     p.add_argument("--model", "-m", type=str, default=None, help="Path to the pretrained model")
@@ -162,10 +191,15 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     val_dataset = GCNDataset(n=args.n_val, max_buf_size=args.max_n_seq, df_path=args.df_val,
-                             seq_len_range=(args.min_len, args.max_len), seed=args.seed+1, verbose=False)
+                             seq_len_range=(args.min_len, args.max_len), pose_feat=args.pose_feat, seed=args.seed+1,
+                             build_on_the_fly=args.build_on_the_fly, contact_cutoff=args.contact_cutoff,
+                             contact_sigma=args.contact_sigma, coor_std=0.0, dummy_ratio=args.dummy_ratio,
+                             verbose=False)
     model = GeneratorLSTM(n_graph_layers=args.n_graph_layers, device=args.gpu, n_lstm_hidden=args.n_lstm_hidden,
-                          n_node_embed=args.n_node_embed, n_seq_embed=args.n_seq_embed,
-                          graph_to_lstm=args.graph_to_lstm, bidirectional_lstm=args.blstm)
+                          n_node_embed=args.n_node_embed, n_seq_embed=args.n_seq_embed, adj_layer=False,
+                          attention_layer=False, n_distance_feat=args.n_dist_embed, n_feat=(20, 26)[args.pose_feat],
+                          graph_to_lstm=args.graph_to_lstm, bidirectional_lstm=args.blstm,
+                          auto_regressive=args.auto_regressive)
     model.seen = 0
     if args.model is not None:
         model.load_state_dict(torch.load(args.model, map_location="cpu"))
@@ -181,10 +215,13 @@ def main():
         pass
     else:
         train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df, h5=args.h5_tmp,
-                                   seq_len_range=(args.min_len, args.max_len), build_on_the_fly=args.build_on_the_fly,
-                                   seed=args.seed, verbose=False)
+                                   seq_len_range=(args.min_len, args.max_len), pose_feat=args.pose_feat,
+                                   build_on_the_fly=args.build_on_the_fly, contact_cutoff=args.contact_cutoff,
+                                   contact_sigma=args.contact_sigma,  coor_std=args.coor_std, seed=args.seed,
+                                   dummy_ratio=args.dummy_ratio, verbose=False)
         model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
-                                device=device, focalloss=args.focalloss, verbose=args.verbose)
+                                device=device, focalloss=args.focalloss, atomloss_weight=args.atomloss_weight,
+                                val_every=args.val_every, verbose=args.verbose)
         if args.save:
             torch.save(model.state_dict(), args.save)
         if args.log:
