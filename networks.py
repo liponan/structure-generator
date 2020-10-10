@@ -50,9 +50,167 @@ class GeneratorLSTM(nn.Module):
 
     def __init__(self, n_feat=20, n_node_embed=64, n_lstm_hidden=128, n_graph_embed=None, n_seq_embed=32,
                  n_seq_alphabets=20, n_graph_layers=1, n_lstm_layers=1, bidirectional_lstm=False, graph_to_lstm=False,
-                 device="cpu"):
+                 auto_regressive=False, adj_layer=False, attention_layer=False, n_distance_feat=0, device="cpu"):
         super(GeneratorLSTM, self).__init__()
         self.graph_to_lstm = graph_to_lstm
+        self.n_lstm_hidden = n_lstm_hidden
+        self.n_lstm_layers = n_lstm_layers
+        self.n_seq_embed = n_seq_embed
+        self.auto_regressive = auto_regressive
+        if bidirectional_lstm:
+            self.n_lstm_directions = 2
+        else:
+            self.n_lstm_directions = 1
+        if adj_layer:
+            self.adj_layer = nn.Linear(n_feat*2 + 1, 1)
+        else:
+            self.adj_layer = None
+        if attention_layer:
+            self.attention1 = nn.Linear(1, 1)
+            self.attention2 = nn.Linear(1, 1)
+            self.attention3 = nn.Linear(1, 1)
+        else:
+            self.attention1 = None
+            self.attention2 = None
+            self.attention3 = None
+        self.feat2embed = nn.Linear(n_feat, n_node_embed)
+        self.gcn = GCN(n_node_embed, n_node_embed, n_node_embed, n_graph_layers, bias=True)
+        if n_distance_feat != 0:
+            self.n_distance_feat = n_distance_feat
+            self.distance_feature = True
+            self.dist2addedge = nn.Linear(4, max(4, n_distance_feat))
+            self.node2addedge = nn.Linear(n_node_embed + max(4, n_distance_feat), self.n_lstm_directions*n_lstm_hidden)
+        else:
+            self.distance_feature = False
+            self.node2addedge = nn.Linear(n_node_embed, self.n_lstm_directions * n_lstm_hidden)
+        self.graph2addedge = nn.Linear(self.n_lstm_directions*n_lstm_hidden, 1)
+        if self.graph_to_lstm:
+            if n_graph_embed is None:
+                self.n_graph_embed = 2 * n_lstm_hidden * n_lstm_layers * self.n_lstm_directions
+            self.nodes2gating = nn.Linear(n_node_embed, self.n_graph_embed)
+            self.nodes2graph = nn.Linear(n_node_embed, self.n_graph_embed)
+        if self.auto_regressive:
+            self.seq2embed = nn.Linear(n_seq_alphabets, self.n_lstm_directions * n_lstm_hidden)
+            self.lstm = nn.LSTM(self.n_lstm_directions * n_lstm_hidden, n_lstm_hidden, num_layers=n_lstm_layers,
+                                bidirectional=bidirectional_lstm)
+        else:
+            self.seq2embed = nn.Linear(n_seq_alphabets, n_seq_embed)
+            self.lstm = nn.LSTM(n_seq_embed, n_lstm_hidden, num_layers=n_lstm_layers, bidirectional=bidirectional_lstm)
+        self.device = device
+        self.sigmoid = nn.Sigmoid()
+        self.dist_cutoff1 = 3.0
+        self.dist_cutoff2 = 5.0
+
+    def get_graph(self, h_nodes):
+        h_graph = self.nodes2graph(h_nodes)
+        h_graph = torch.sum(nn.Sigmoid()(self.nodes2gating(h_nodes)) * h_graph, dim=0)
+        return h_graph
+
+    def dist2feat(self, dists, mask, prev_idx):
+        n = dists.size(0)
+        feat = torch.zeros(n, 4).to(self.device)
+        if prev_idx == -1 or mask[prev_idx] < 1:
+            feat[:, 0] = 1.0
+            return feat
+        else:
+            feat[:, 0] = mask < 0
+            feat[:, 1] = torch.logical_and(dists[prev_idx, :] < self.dist_cutoff1, mask > 0)
+            feat[:, 3] = torch.logical_and(dists[prev_idx, :] > self.dist_cutoff2, mask > 0)
+            feat[:, 2] = 1.0 - torch.sum(feat, dim=1)
+            return feat
+
+    def forward(self, x_tensor, f_tensor, a_tensor, d_tensor, coor_tensor=None, mask_tensor=None):
+        n = int(x_tensor.size(0))
+        m = int(f_tensor.size(0))
+        seq_embed = self.seq2embed(x_tensor)
+        f_nodes_in = self.feat2embed(f_tensor)
+        if self.adj_layer is not None and coor_tensor is not None:
+            dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2)
+            a_tensor = torch.cat((f_tensor[:, None, :].expand(-1, m, -1), f_tensor[None, :, :].expand(m, -1, -1),
+                                  dists[:, :, None]), dim=2).view(m*m, -1)
+            a_tensor = self.sigmoid(self.adj_layer(a_tensor)).view(m, m)
+            d_tensor = torch.eye(m).to(self.device) * torch.pow(torch.sum(a_tensor, dim=1), -0.5)
+        if self.attention1 is not None and coor_tensor is not None:
+            dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2).view(m*m, 1)
+            a_tensor, _ = torch.max(torch.cat((self.sigmoid(self.attention1(dists)).view(m, m, 1),
+                                               self.sigmoid(self.attention2(dists)).view(m, m, 1),
+                                               self.sigmoid(self.attention3(dists)).view(m, m, 1)), dim=2), dim=2)
+            d_tensor = torch.eye(m).to(self.device) * torch.pow(torch.sum(a_tensor, dim=1), -0.5)
+        h_nodes_in = self.gcn(a_tensor, d_tensor, nn.ReLU()(f_nodes_in))
+        if self.graph_to_lstm:
+            h_graph = self.get_graph(h_nodes_in).view(2, -1)
+            h = h_graph[0, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
+            c = h_graph[1, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
+        else:
+            h = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
+            c = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
+        if self.auto_regressive:
+            if self.distance_feature:
+                dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2)
+                lstm_out, (h, c) = self.lstm(seq_embed[0, None, None, :], (h, c))
+                dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, -1))
+                my_score = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+                my_score += lstm_out[0, :]
+                scores = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+                idxs = torch.argmax(scores, dim=1).view(1)
+                for i in range(1, n):
+                    lstm_in = seq_embed[i, None, None, :] + my_score[idxs[-1], None, None, :]
+                    lstm_out, (h, c) = self.lstm(lstm_in, (h, c))
+                    dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, idxs[-1]))
+                    my_score = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+                    my_score += lstm_out[0, :]
+                    score = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+                    scores = torch.cat((scores, score), dim=0)
+                    idxs = torch.cat((idxs, torch.argmax(score, dim=1).view(1)), dim=0)
+            else:
+                lstm_out, (h, c) = self.lstm(seq_embed[0, None, None, :], (h, c))
+                my_score = self.node2addedge(h_nodes_in).view(m, -1)
+                my_score += lstm_out[0, :]
+                scores = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+                idxs = torch.argmax(scores, dim=1).view(1)
+                for i in range(1, n):
+                    lstm_in = seq_embed[i, None, None, :] + my_score[idxs[-1], None, None, :]
+                    lstm_out, (h, c) = self.lstm(lstm_in, (h, c))
+                    my_score = self.node2addedge(h_nodes_in).view(m, -1)
+                    my_score += lstm_out[0, :]
+                    score = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+                    scores = torch.cat((scores, score), dim=0)
+                    idxs = torch.cat((idxs, torch.argmax(score, dim=1).view(1)), dim=0)
+        else:
+            lstm_out, _ = self.lstm(seq_embed.view(-1, 1, self.n_seq_embed), (h, c))
+            if self.distance_feature:
+                dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2)
+                if self.n_distance_feat > 0:
+                    dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, -1))
+                else:
+                    dist_feat = self.dist2feat(dists, mask_tensor, -1)
+                # print("dist_feat", dist_feat.size())
+                # print("z", z.size())
+                scores = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+                scores += lstm_out[0, :]
+                scores = self.graph2addedge(nn.ReLU()(scores.view(m, -1))).view(1, m)
+                idxs = torch.argmax(scores, dim=1).view(1)
+                for i in range(1, n):
+                    dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, idxs[-1]))
+                    score = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+                    score += lstm_out[i, :]
+                    score = self.graph2addedge(nn.ReLU()(score.view(m, -1))).view(1, m)
+                    scores = torch.cat((scores, score), dim=0)
+                    idxs = torch.cat((idxs, torch.argmax(score, dim=1).view(1)), dim=0)
+            else:
+                scores = self.node2addedge(h_nodes_in).view(1, m, -1).repeat(n, 1, 1)
+                scores += lstm_out.view(n, 1, -1).repeat(1, m, 1)
+                scores = self.graph2addedge(nn.ReLU()(scores.view(n*m, -1))).view(n, m)
+                idxs = torch.argmax(scores, dim=1)
+        return scores, idxs
+
+
+class BiGeneratorLSTM(nn.Module):
+
+    def __init__(self, n_feat=20, n_node_embed=64, n_lstm_hidden=128, n_graph_embed=None, n_seq_embed=32,
+                 n_seq_alphabets=20, n_graph_layers=2, n_lstm_layers=1, bidirectional_lstm=True, n_distance_feat=4,
+                 device="cpu"):
+        super(BiGeneratorLSTM, self).__init__()
         self.n_lstm_hidden = n_lstm_hidden
         self.n_lstm_layers = n_lstm_layers
         self.n_seq_embed = n_seq_embed
@@ -62,40 +220,87 @@ class GeneratorLSTM(nn.Module):
             self.n_lstm_directions = 1
         self.feat2embed = nn.Linear(n_feat, n_node_embed)
         self.gcn = GCN(n_node_embed, n_node_embed, n_node_embed, n_graph_layers, bias=True)
-        self.lstm = nn.LSTM(n_seq_embed, n_lstm_hidden, num_layers=n_lstm_layers, bidirectional=bidirectional_lstm)
-        self.node2addedge = nn.Linear(n_node_embed, self.n_lstm_directions*n_lstm_hidden)
+        if n_distance_feat != 0:
+            self.n_distance_feat = n_distance_feat
+            self.distance_feature = True
+            self.dist2addedge = nn.Linear(4, max(4, n_distance_feat))
+            self.node2addedge = nn.Linear(n_node_embed + max(4, n_distance_feat), self.n_lstm_directions*n_lstm_hidden)
+        else:
+            self.distance_feature = False
+            self.node2addedge = nn.Linear(n_node_embed, self.n_lstm_directions * n_lstm_hidden)
         self.graph2addedge = nn.Linear(self.n_lstm_directions*n_lstm_hidden, 1)
         if self.graph_to_lstm:
             if n_graph_embed is None:
                 self.n_graph_embed = 2 * n_lstm_hidden * n_lstm_layers * self.n_lstm_directions
             self.nodes2gating = nn.Linear(n_node_embed, self.n_graph_embed)
             self.nodes2graph = nn.Linear(n_node_embed, self.n_graph_embed)
-        self.seq2embed = nn.Linear(n_seq_alphabets, n_seq_embed)
+        if self.auto_regressive:
+            self.seq2embed = nn.Linear(n_seq_alphabets, self.n_lstm_directions * n_lstm_hidden)
+            self.lstm = nn.LSTM(self.n_lstm_directions * n_lstm_hidden, n_lstm_hidden, num_layers=n_lstm_layers,
+                                bidirectional=bidirectional_lstm)
+        else:
+            self.seq2embed = nn.Linear(n_seq_alphabets, n_seq_embed)
+            self.lstm = nn.LSTM(n_seq_embed, n_lstm_hidden, num_layers=n_lstm_layers, bidirectional=bidirectional_lstm)
         self.device = device
+        self.sigmoid = nn.Sigmoid()
+        self.dist_cutoff1 = 3.0
+        self.dist_cutoff2 = 5.0
 
     def get_graph(self, h_nodes):
         h_graph = self.nodes2graph(h_nodes)
         h_graph = torch.sum(nn.Sigmoid()(self.nodes2gating(h_nodes)) * h_graph, dim=0)
         return h_graph
 
-    def forward(self, x_tensor, f_tensor, a_tensor, d_tensor):
+    def dist2feat(self, dists, mask, prev_idx):
+        n = dists.size(0)
+        feat = torch.zeros(n, 4).to(self.device)
+        if prev_idx == -1 or mask[prev_idx] < 1:
+            feat[:, 0] = 1.0
+            return feat
+        else:
+            feat[:, 0] = mask < 0
+            feat[:, 1] = torch.logical_and(dists[prev_idx, :] < self.dist_cutoff1, mask > 0)
+            feat[:, 3] = torch.logical_and(dists[prev_idx, :] > self.dist_cutoff2, mask > 0)
+            feat[:, 2] = 1.0 - torch.sum(feat, dim=1)
+            return feat
+
+    def forward(self, x_tensor, f_tensor, a_tensor, d_tensor, coor_tensor=None, mask_tensor=None):
         n = int(x_tensor.size(0))
         m = int(f_tensor.size(0))
         seq_embed = self.seq2embed(x_tensor)
         f_nodes_in = self.feat2embed(f_tensor)
+        if self.adj_layer is not None and coor_tensor is not None:
+            dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2)
+            a_tensor = torch.cat((f_tensor[:, None, :].expand(-1, m, -1), f_tensor[None, :, :].expand(m, -1, -1),
+                                  dists[:, :, None]), dim=2).view(m*m, -1)
+            a_tensor = self.sigmoid(self.adj_layer(a_tensor)).view(m, m)
+            d_tensor = torch.eye(m).to(self.device) * torch.pow(torch.sum(a_tensor, dim=1), -0.5)
+        if self.attention1 is not None and coor_tensor is not None:
+            dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2).view(m*m, 1)
+            a_tensor, _ = torch.max(torch.cat((self.sigmoid(self.attention1(dists)).view(m, m, 1),
+                                               self.sigmoid(self.attention2(dists)).view(m, m, 1),
+                                               self.sigmoid(self.attention3(dists)).view(m, m, 1)), dim=2), dim=2)
+            d_tensor = torch.eye(m).to(self.device) * torch.pow(torch.sum(a_tensor, dim=1), -0.5)
         h_nodes_in = self.gcn(a_tensor, d_tensor, nn.ReLU()(f_nodes_in))
-        if self.graph_to_lstm:
-            h_graph = self.get_graph(h_nodes_in).view(2, -1)
-            h = h_graph[0, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
-            c = h_graph[1, :].view(-1, 1, self.n_lstm_hidden).to(self.device)
-        else:
-            h = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
-            c = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
-        lstm_out, _ = self.lstm(seq_embed.view(-1, 1, self.n_seq_embed), (h, c))
-        scores = self.node2addedge(h_nodes_in).view(1, m, -1).repeat(n, 1, 1)
-        scores += lstm_out.view(n, 1, -1).repeat(1, m, 1)
-        scores = self.graph2addedge(nn.ReLU()(scores.view(n*m, -1))).view(n, m)
-        idxs = torch.argmax(scores, dim=1)
+        h = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
+        c = torch.zeros(self.n_lstm_layers * self.n_lstm_directions, 1, self.n_lstm_hidden).to(self.device)
+        dists = torch.norm(coor_tensor[:, None, :] - coor_tensor[None, :, :], dim=2)
+        lstm_out, (h, c) = self.lstm(seq_embed[0, None, None, :], (h, c))
+        dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, -1))
+        my_score = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+        my_score += lstm_out[0, :]
+        scores = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+        idxs = torch.argmax(scores, dim=1).view(1)
+        for i in range(1, n):
+            lstm_in = seq_embed[i, None, None, :] + my_score[idxs[-1], None, None, :]
+            lstm_out, (h, c) = self.lstm(lstm_in, (h, c))
+            dist_feat = self.dist2addedge(self.dist2feat(dists, mask_tensor, idxs[-1]))
+            my_score = self.node2addedge(torch.cat((h_nodes_in, dist_feat), dim=1)).view(m, -1)
+            my_score += lstm_out[0, :]
+            score = self.graph2addedge(nn.ReLU()(my_score.view(m, -1))).view(1, m)
+            scores = torch.cat((scores, score), dim=0)
+            idxs = torch.cat((idxs, torch.argmax(score, dim=1).view(1)), dim=0)
+
         return scores, idxs
 
 
