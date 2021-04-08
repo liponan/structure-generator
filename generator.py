@@ -10,11 +10,12 @@ import torch.nn as nn
 import torch.optim as optim
 from aa_code_utils import *
 from dataset import GCNDataset
+from deepmap_dataset import DeepMapDataset
 from networks import GeneratorLSTM, FocalLoss
 import argparse
 
 
-def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, log_every=100, val_every=2000,
+def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=10, log_every=10, val_every=1000,
           focalloss=None, atomloss_weight=0, device=None, verbose=False):
     print("====================== train ======================")
     t0 = time.time()
@@ -26,7 +27,7 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
     atom_loss_fn = nn.SmoothL1Loss()
     atomloss_threshold = torch.Tensor([4.0]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=False)
     for i in range(n_epoch):
         t1 = time.time()
         for j, data in enumerate(dataloader):
@@ -82,6 +83,8 @@ def train(model, dataset, val_dataset=None, n_epoch=1, lr=0.1, print_every=100, 
                             t2 = time.time()
                             eta = (t2 - t1) / float(j + 1) * float(len(dataset) - j - 1)
                             print("seen {}, acc {:.4f}, {:.1f}s to go for this epoch".format(model.seen, val_acc, eta))
+                if (j+1) % 100 == 0:
+                    torch.save(model.state_dict(), "debug_{}.pt".format(j+1))
         if val_dataset is not None:
             with torch.no_grad():
                 val_acc = val(model, val_dataset, device=device, verbose=False)
@@ -99,7 +102,6 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=No
     model.eval()
     with torch.no_grad():
         for j in range(len(dataset)):
-            model.zero_grad()
             x, f, a_mat, d_mat, gt_idxs, ca_coor, ca_mask = dataset[j]
             n = len(gt_idxs)
             x_tensor = torch.from_numpy(x).float()
@@ -120,7 +122,7 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=No
             scores, idxs = model(x_tensor, f_tensor, a_tensor, d_tensor, coor_tensor, mask_tensor)
             idxs = np.array(idxs.data.cpu())
             if reverse_seq:
-                _, rev_idxs = model(torch.flip(x_tensor, [0]), f_tensor, a_tensor, d_tensor)
+                _, rev_idxs = model(torch.flip(x_tensor, [0]), f_tensor, a_tensor, d_tensor, coor_tensor, mask_tensor)
                 rev_idxs = np.array(torch.flip(rev_idxs, [0]).data.cpu())
                 mask1 = torch.argmax(f_tensor[gt_idxs, 0:20], dim=1) == torch.argmax(f_tensor[rev_idxs, 0:20], dim=1)
                 mask2 = torch.argmax(f_tensor[gt_idxs, 0:20], dim=1) != torch.argmax(f_tensor[idxs, 0:20], dim=1)
@@ -144,7 +146,7 @@ def val(model, dataset, device=None, verbose=False, reverse_seq=False, output=No
     if verbose:
         print("overall acc:", acc_all)
     return acc_all
-            
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -178,28 +180,44 @@ def parse_args():
     p.add_argument("--save", "-s", type=str, default=None, help="Path and file name for saving trained model")
     p.add_argument("--save_val", type=str, default=None, help="Path saving inference results")
     p.add_argument("--model", "-m", type=str, default=None, help="Path to the pretrained model")
-    p.add_argument("--log", type=str, default=None, help="Path and file name for saving training log")
+    p.add_argument("--log", action="store_true", help="Save training log")
     p.add_argument("--skip_training", action="store_true", help="Skip training")
     p.add_argument("--reverse_seq", action="store_true", help="Reverse sequence when validating")
     p.add_argument("--h5_tmp", type=str, default=None, help="Save simulated data as h5 file to the given path")
     p.add_argument("--build_on_the_fly", action="store_true", help="Generate simulated data on the fly")
+    p.add_argument("--deepmap", action="store_true", help="Use DeepMapDataset")
+    p.add_argument("--deepmap_train_path", type=str, default=None, help="Path of DM training data")
+    p.add_argument("--deepmap_val_path", type=str, default=None, help="Path of DM val data")
     p.add_argument("--verbose", "-v", action="store_true", help="Be verbose")
     return p.parse_args()
 
-    
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    val_dataset = GCNDataset(n=args.n_val, max_buf_size=args.max_n_seq, df_path=args.df_val,
-                             seq_len_range=(args.min_len, args.max_len), pose_feat=args.pose_feat, seed=args.seed+1,
-                             build_on_the_fly=args.build_on_the_fly, contact_cutoff=args.contact_cutoff,
-                             contact_sigma=args.contact_sigma, coor_std=0.0, dummy_ratio=args.dummy_ratio,
-                             verbose=False)
-    model = GeneratorLSTM(n_graph_layers=args.n_graph_layers, device=args.gpu, n_lstm_hidden=args.n_lstm_hidden,
-                          n_node_embed=args.n_node_embed, n_seq_embed=args.n_seq_embed, adj_layer=False,
-                          attention_layer=False, n_distance_feat=args.n_dist_embed, n_feat=(20, 26)[args.pose_feat],
-                          graph_to_lstm=args.graph_to_lstm, bidirectional_lstm=args.blstm,
-                          auto_regressive=args.auto_regressive)
+    if args.deepmap:
+        val_dataset = DeepMapDataset(
+            data_path=args.deepmap_val_path,
+            ca_ca_cutoff=4.5,
+        )
+    else:
+        val_dataset = GCNDataset(
+            n=args.n_val, max_buf_size=args.max_n_seq, df_path=args.df_val,
+            seq_len_range=(args.min_len, args.max_len),
+            pose_feat=args.pose_feat, seed=args.seed+1,
+            build_on_the_fly=args.build_on_the_fly,
+            contact_cutoff=args.contact_cutoff,
+            contact_sigma=args.contact_sigma, coor_std=0.0, dummy_ratio=1,
+            verbose=False
+        )
+    model = GeneratorLSTM(
+        n_graph_layers=args.n_graph_layers, device=args.gpu,
+        n_lstm_hidden=args.n_lstm_hidden, n_node_embed=args.n_node_embed,
+        n_seq_embed=args.n_seq_embed, adj_layer=False, attention_layer=False,
+        n_distance_feat=args.n_dist_embed, n_feat=(20, 26)[args.pose_feat],
+        graph_to_lstm=args.graph_to_lstm, bidirectional_lstm=args.blstm,
+        auto_regressive=args.auto_regressive
+    )
     model.seen = 0
     if args.model is not None:
         model.load_state_dict(torch.load(args.model, map_location="cpu"))
@@ -214,21 +232,37 @@ def main():
     if args.skip_training:
         pass
     else:
-        train_dataset = GCNDataset(n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df, h5=args.h5_tmp,
-                                   seq_len_range=(args.min_len, args.max_len), pose_feat=args.pose_feat,
-                                   build_on_the_fly=args.build_on_the_fly, contact_cutoff=args.contact_cutoff,
-                                   contact_sigma=args.contact_sigma,  coor_std=args.coor_std, seed=args.seed,
-                                   dummy_ratio=args.dummy_ratio, verbose=False)
-        model, json_log = train(model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch, lr=args.lr,
-                                device=device, focalloss=args.focalloss, atomloss_weight=args.atomloss_weight,
-                                val_every=args.val_every, verbose=args.verbose)
+        if args.deepmap:
+            train_dataset = DeepMapDataset(
+                data_path=args.deepmap_train_path,
+                ca_ca_cutoff=4.5,
+            )
+        else:
+            train_dataset = GCNDataset(
+                n=args.n_train, max_buf_size=args.max_n_seq, df_path=args.df,
+                h5=args.h5_tmp, seq_len_range=(args.min_len, args.max_len),
+                pose_feat=args.pose_feat,
+                build_on_the_fly=args.build_on_the_fly,
+                contact_cutoff=args.contact_cutoff,
+                contact_sigma=args.contact_sigma,  coor_std=args.coor_std,
+                seed=args.seed, dummy_ratio=args.dummy_ratio, verbose=False
+            )
+        model, json_log = train(
+            model, train_dataset, val_dataset=val_dataset, n_epoch=args.n_epoch,
+            lr=args.lr, device=device, focalloss=args.focalloss,
+            atomloss_weight=args.atomloss_weight, val_every=args.val_every,
+            verbose=args.verbose
+        )
         if args.save:
             torch.save(model.state_dict(), args.save)
         if args.log:
             json_log["params"] = args.__dict__
-            with open(args.log, "w") as f:
+            with open(args.save.replace(".pt", ".log"), "w") as f:
                 f.write(json.dumps(json_log))
-    val_acc = val(model, val_dataset, device=device, verbose=True, reverse_seq=args.reverse_seq, output=args.save_val)
+    val_acc = val(
+        model, val_dataset, device=device, verbose=True,
+        reverse_seq=args.reverse_seq, output=args.save_val
+    )
     print("test on validation set: {:.5f}".format(val_acc))
 
 
